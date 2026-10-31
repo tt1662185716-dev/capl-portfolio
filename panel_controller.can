@@ -1,0 +1,223 @@
+/*-----------------------------------------------------------------------------
+ *  panel_controller.can
+ *
+ *  Panel / system-variable driven test orchestration.
+ *  The test engineer presses a button on a CANoe Panel; this script starts a
+ *  run, streams progress back to the panel and reports the final verdict.
+ *
+ *  Required system variables (create with the System Variables editor,
+ *  namespace "Panel"):
+ *
+ *    Panel::StartButton   int     1 = pressed      (written by the panel)
+ *    Panel::StopButton    int     1 = pressed      (written by the panel)
+ *    Panel::Progress      int     0..100           (written by this script)
+ *    Panel::StatusText    string  current phase    (written by this script)
+ *    Panel::Verdict       int     0 = idle, 1 = pass, 2 = fail
+ *
+ *  If no panel is configured, the number keys below drive the same logic so
+ *  the file can be tested without any UI:
+ *    '1' start   '2' stop   '3' force pass   '4' force fail
+ *----------------------------------------------------------------------------*/
+
+variables
+{
+  msTimer tProgress;
+
+  long PROGRESS_STEP_MS = 300;
+  long PROGRESS_MAX     = 100;
+  long PROGRESS_DELTA   = 10;
+
+  long gRunning  = 0;
+  long gProgress = 0;
+
+  long VERDICT_IDLE = 0;
+  long VERDICT_PASS = 1;
+  long VERDICT_FAIL = 2;
+}
+
+/*-----------------------------------------------------------------------------
+ *  Panel output helpers
+ *----------------------------------------------------------------------------*/
+
+void setStatus(char text[])
+{
+  @Panel::StatusText = text;
+  write("[PANEL] status: %s", text);
+}
+
+void setProgress(long value)
+{
+  if (value < 0)
+  {
+    value = 0;
+  }
+  if (value > PROGRESS_MAX)
+  {
+    value = PROGRESS_MAX;
+  }
+
+  gProgress = value;
+  @Panel::Progress = value;
+}
+
+void setVerdict(long verdict)
+{
+  @Panel::Verdict = verdict;
+
+  if (verdict == VERDICT_PASS)
+  {
+    setStatus("PASS");
+  }
+  else if (verdict == VERDICT_FAIL)
+  {
+    setStatus("FAIL");
+  }
+  else
+  {
+    setStatus("IDLE");
+  }
+}
+
+/*-----------------------------------------------------------------------------
+ *  Run control
+ *----------------------------------------------------------------------------*/
+
+void startRun()
+{
+  if (gRunning == 1)
+  {
+    write("[PANEL] run already in progress, ignored");
+    return;
+  }
+
+  gRunning = 1;
+  setVerdict(VERDICT_IDLE);
+  setProgress(0);
+  setStatus("RUNNING");
+
+  write("[PANEL] test run started");
+  setTimer(tProgress, PROGRESS_STEP_MS);
+}
+
+void stopRun()
+{
+  if (gRunning == 0)
+  {
+    return;
+  }
+
+  cancelTimer(tProgress);
+  gRunning = 0;
+
+  setStatus("ABORTED");
+  write("[PANEL] test run aborted at %d %%", gProgress);
+}
+
+void finishRun(long passed)
+{
+  cancelTimer(tProgress);
+  gRunning = 0;
+  setProgress(PROGRESS_MAX);
+
+  if (passed == 1)
+  {
+    setVerdict(VERDICT_PASS);
+    write("[PANEL] run finished - PASS");
+  }
+  else
+  {
+    setVerdict(VERDICT_FAIL);
+    write("[PANEL] run finished - FAIL");
+  }
+}
+
+/*-----------------------------------------------------------------------------
+ *  Progress tick
+ *----------------------------------------------------------------------------*/
+
+on timer tProgress
+{
+  if (gRunning == 0)
+  {
+    return;
+  }
+
+  setProgress(gProgress + PROGRESS_DELTA);
+
+  if (gProgress >= PROGRESS_MAX)
+  {
+    /* Replace this with the real verdict of your sequence, e.g. a counter of
+       failed checks. Kept explicit so the panel logic stays readable. */
+    finishRun(1);
+    return;
+  }
+
+  setTimer(tProgress, PROGRESS_STEP_MS);
+}
+
+/*-----------------------------------------------------------------------------
+ *  Panel events
+ *----------------------------------------------------------------------------*/
+
+on sysvar Panel::StartButton
+{
+  if (@Panel::StartButton == 1)
+  {
+    startRun();
+  }
+}
+
+on sysvar Panel::StopButton
+{
+  if (@Panel::StopButton == 1)
+  {
+    stopRun();
+  }
+}
+
+/*-----------------------------------------------------------------------------
+ *  Lifecycle
+ *----------------------------------------------------------------------------*/
+
+on start
+{
+  setVerdict(VERDICT_IDLE);
+  setProgress(0);
+  setStatus("READY");
+}
+
+on stopMeasurement
+{
+  if (gRunning == 1)
+  {
+    cancelTimer(tProgress);
+    gRunning = 0;
+    write("[PANEL] measurement stopped while a run was active");
+  }
+
+  setStatus("STOPPED");
+}
+
+/*-----------------------------------------------------------------------------
+ *  Keyboard fallback, so the file can be exercised without a panel
+ *----------------------------------------------------------------------------*/
+
+on key '1'
+{
+  startRun();
+}
+
+on key '2'
+{
+  stopRun();
+}
+
+on key '3'
+{
+  finishRun(1);
+}
+
+on key '4'
+{
+  finishRun(0);
+}

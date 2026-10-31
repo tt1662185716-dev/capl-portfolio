@@ -1,0 +1,396 @@
+/*-----------------------------------------------------------------------------
+ *  automated_test_sequence.can
+ *
+ *  A timer-driven test runner: six sequential steps, each with an explicit
+ *  pass/fail criterion, followed by a summary report.
+ *
+ *  The runner deliberately does not use the CAPL Test Feature Set
+ *  (testWaitFor...), because that requires an additional licence. Instead it
+ *  uses msTimer + a state machine, which runs on any CANoe installation.
+ *
+ *  Prerequisites : expects the frames produced by can_message_simulator.can
+ *                  (0x100 status, 0x300 alive) - then no DBC is required.
+ *  Keys          : 't' start, 'x' abort
+ *
+ *  Why each step exists
+ *    1  bus alive            - is anything arriving at all
+ *    2  alive counter        - are frames missing (the classic silent failure)
+ *    3  rpm plausibility     - is the decoded value physically sane
+ *    4  enable state         - does the state machine actually reach "active"
+ *    5  frame loss rate      - quality of the link, not just presence
+ *    6  summary              - aggregate result, one line per step
+ *----------------------------------------------------------------------------*/
+
+variables
+{
+  /* -------- timing -------- */
+  msTimer tStep;
+  long  STEP_DELAY_MS = 500;
+  long  START_DELAY_MS = 300;
+
+  /* -------- step model -------- */
+  long  STEP_TOTAL = 6;
+  long  gStep      = 0;
+  long  gRunning   = 0;
+
+  /* -------- results -------- */
+  long  gResult[6];
+  long  gPassCount = 0;
+  long  gFailCount = 0;
+
+  /* -------- observations collected from the bus -------- */
+  long  gStatusFrames = 0;
+  long  gAliveFrames  = 0;
+  long  gLastAlive    = -1;
+  long  gLostFrames   = 0;
+  long  gRpmMin       = 0x7FFFFFFF;
+  long  gRpmMax       = 0;
+  long  gEnableSeen   = 0;
+  long  gShortFrames  = 0;
+
+  /* -------- limits -------- */
+  long  RPM_PLAUSIBLE_MIN = 500;
+  long  RPM_PLAUSIBLE_MAX = 4500;
+  long  MAX_LOST_FRAMES   = 0;
+}
+
+/*-----------------------------------------------------------------------------
+ *  Setup
+ *----------------------------------------------------------------------------*/
+
+void resetObservations()
+{
+  long i;
+
+  gStatusFrames = 0;
+  gAliveFrames  = 0;
+  gLastAlive    = -1;
+  gLostFrames   = 0;
+  gRpmMin       = 0x7FFFFFFF;
+  gRpmMax       = 0;
+  gEnableSeen   = 0;
+  gShortFrames  = 0;
+
+  for (i = 0; i < STEP_TOTAL; i++)
+  {
+    gResult[i] = -1;
+  }
+}
+
+void recordResult(long index, long passed, char reason[])
+{
+  if (index < 0 || index >= STEP_TOTAL)
+  {
+    return;
+  }
+
+  gResult[index] = passed;
+
+  if (passed == 1)
+  {
+    gPassCount = gPassCount + 1;
+    write("         result : PASS  %s", reason);
+  }
+  else
+  {
+    gFailCount = gFailCount + 1;
+    write("         result : FAIL  %s", reason);
+  }
+}
+
+/*-----------------------------------------------------------------------------
+ *  Steps
+ *----------------------------------------------------------------------------*/
+
+void stepBusAlive()
+{
+  write("[STEP 1/6] bus alive - expecting at least one 0x100 frame");
+
+  if (gStatusFrames > 0)
+  {
+    recordResult(0, 1, "status frame received");
+  }
+  else
+  {
+    recordResult(0, 0, "no 0x100 frame on the bus");
+  }
+}
+
+void stepAliveCounter()
+{
+  write("[STEP 2/6] alive counter continuity");
+
+  if (gAliveFrames < 2)
+  {
+    recordResult(1, 0, "not enough 0x300 frames to evaluate continuity");
+    return;
+  }
+
+  if (gLostFrames <= MAX_LOST_FRAMES)
+  {
+    recordResult(1, 1, "no frame gap detected");
+  }
+  else
+  {
+    recordResult(1, 0, "frame gaps detected - see WARN lines above");
+  }
+}
+
+void stepRpmPlausibility()
+{
+  write("[STEP 3/6] rpm plausibility - range %d..%d",
+        RPM_PLAUSIBLE_MIN, RPM_PLAUSIBLE_MAX);
+
+  if (gStatusFrames == 0)
+  {
+    recordResult(2, 0, "no data to evaluate");
+    return;
+  }
+
+  if (gRpmMin < RPM_PLAUSIBLE_MIN)
+  {
+    recordResult(2, 0, "rpm below the plausible minimum");
+    return;
+  }
+
+  if (gRpmMax > RPM_PLAUSIBLE_MAX)
+  {
+    recordResult(2, 0, "rpm above the plausible maximum");
+    return;
+  }
+
+  recordResult(2, 1, "all decoded values inside the plausible range");
+}
+
+void stepEnableState()
+{
+  write("[STEP 4/6] output enable state observed");
+
+  if (gEnableSeen == 1)
+  {
+    recordResult(3, 1, "enable bit was set at least once");
+  }
+  else
+  {
+    recordResult(3, 0, "enable bit never observed");
+  }
+}
+
+void stepFrameLoss()
+{
+  long total;
+  long lostPercent;
+
+  write("[STEP 5/6] frame loss and malformed frames");
+
+  total = gStatusFrames + gLostFrames;
+  if (total <= 0)
+  {
+    recordResult(4, 0, "no traffic to evaluate");
+    return;
+  }
+
+  lostPercent = (gLostFrames * 100) / total;
+
+  if (gShortFrames > 0)
+  {
+    recordResult(4, 0, "malformed short frames were received");
+    return;
+  }
+
+  if (gLostFrames <= MAX_LOST_FRAMES)
+  {
+    recordResult(4, 1, "no loss, no malformed frames");
+  }
+  else
+  {
+    recordResult(4, 0, "frames lost during the run");
+  }
+}
+
+void stepSummary()
+{
+  long i;
+  long rate;
+
+  write("[STEP 6/6] summary");
+
+  rate = 0;
+  if (gPassCount + gFailCount > 0)
+  {
+    rate = (gPassCount * 100) / (gPassCount + gFailCount);
+  }
+
+  write("--------------------------------------------------");
+  for (i = 0; i < STEP_TOTAL; i++)
+  {
+    if (gResult[i] == 1)
+    {
+      write("  step %d : PASS", i + 1);
+    }
+    else
+    {
+      write("  step %d : FAIL", i + 1);
+    }
+  }
+  write("--------------------------------------------------");
+
+  if (gFailCount == 0)
+  {
+    recordResult(5, 1, "all checks passed");
+  }
+  else
+  {
+    recordResult(5, 0, "one or more checks failed");
+  }
+
+  write("[TEST] PASS %d / FAIL %d  (pass rate %d %%)",
+        gPassCount, gFailCount, rate);
+}
+
+void executeStep(long index)
+{
+  switch (index)
+  {
+    case 0: stepBusAlive();       break;
+    case 1: stepAliveCounter();   break;
+    case 2: stepRpmPlausibility();break;
+    case 3: stepEnableState();    break;
+    case 4: stepFrameLoss();      break;
+    case 5: stepSummary();        break;
+    default: break;
+  }
+}
+
+/*-----------------------------------------------------------------------------
+ *  Runner
+ *----------------------------------------------------------------------------*/
+
+void startSequence()
+{
+  resetObservations();
+
+  gRunning   = 1;
+  gStep      = 0;
+  gPassCount = 0;
+  gFailCount = 0;
+
+  write("==================================================");
+  write("[TEST] sequence started - %d steps", STEP_TOTAL);
+  write("==================================================");
+
+  setTimer(tStep, START_DELAY_MS);
+}
+
+void abortSequence()
+{
+  if (gRunning == 0)
+  {
+    return;
+  }
+
+  cancelTimer(tStep);
+  gRunning = 0;
+
+  write("[TEST] sequence ABORTED at step %d", gStep + 1);
+}
+
+void finishSequence()
+{
+  gRunning = 0;
+  write("==================================================");
+  write("[TEST] sequence finished");
+  write("==================================================");
+}
+
+on timer tStep
+{
+  if (gRunning == 0)
+  {
+    return;
+  }
+
+  executeStep(gStep);
+  gStep = gStep + 1;
+
+  if (gStep >= STEP_TOTAL)
+  {
+    finishSequence();
+    return;
+  }
+
+  setTimer(tStep, STEP_DELAY_MS);
+}
+
+/*-----------------------------------------------------------------------------
+ *  Bus observations
+ *----------------------------------------------------------------------------*/
+
+on message 0x100
+{
+  long rpmRaw;
+  long rpm;
+
+  if (this.dlc < 6)
+  {
+    gShortFrames = gShortFrames + 1;
+    return;
+  }
+
+  rpmRaw = (long)this.byte(0) | ((long)this.byte(1) << 8);
+  rpm    = rpmRaw / 4;
+
+  gStatusFrames = gStatusFrames + 1;
+
+  if (rpm < gRpmMin)
+  {
+    gRpmMin = rpm;
+  }
+  if (rpm > gRpmMax)
+  {
+    gRpmMax = rpm;
+  }
+  if ((long)this.byte(5) == 1)
+  {
+    gEnableSeen = 1;
+  }
+}
+
+on message 0x300
+{
+  long counter;
+  long expected;
+
+  if (this.dlc < 1)
+  {
+    return;
+  }
+
+  counter = (long)this.byte(0);
+
+  if (gLastAlive >= 0)
+  {
+    expected = (gLastAlive + 1) & 0xFF;
+    if (counter != expected)
+    {
+      gLostFrames = gLostFrames + 1;
+    }
+  }
+
+  gLastAlive   = counter;
+  gAliveFrames = gAliveFrames + 1;
+}
+
+/*-----------------------------------------------------------------------------
+ *  Keyboard control
+ *----------------------------------------------------------------------------*/
+
+on key 't'
+{
+  startSequence();
+}
+
+on key 'x'
+{
+  abortSequence();
+}

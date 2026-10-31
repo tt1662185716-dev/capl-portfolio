@@ -1,0 +1,240 @@
+/*-----------------------------------------------------------------------------
+ *  can_message_simulator.can
+ *
+ *  Periodic and event-driven CAN simulation for bench / HIL setups.
+ *  Emits a status frame, an alive-counter frame and a command frame, and
+ *  reacts to inbound commands on 0x200.
+ *
+ *  Prerequisites : none (classic CAN, raw byte layout, no DBC required)
+ *  Bus           : one CAN channel
+ *
+ *  Frame layout
+ *    0x100  Status   byte 0-1  engine speed, 0.25 rpm/bit, little endian
+ *                    byte 2-3  vehicle speed, 0.01 km/h/bit, little endian
+ *                    byte 4    gear
+ *                    byte 5    output enable (1 = active)
+ *                    byte 6    rolling cycle counter
+ *                    byte 7    cycle counter low byte
+ *    0x200  Command  byte 0-1  target speed, 0.01 km/h/bit
+ *    0x300  Alive    byte 0    rolling alive counter
+ *                    byte 1    cycle counter low byte
+ *
+ *  Keys
+ *    'a'  enable output      's'  disable output
+ *    'r'  reset state        'c'  send a command frame
+ *----------------------------------------------------------------------------*/
+
+variables
+{
+  /* -------- configuration -------- */
+  long  CYCLE_MS     = 100;      /* main simulation cycle [ms]              */
+  long  RPM_MIN      = 800;
+  long  RPM_MAX      = 4000;
+  long  RPM_STEP     = 10;       /* rpm change per cycle in the ramp        */
+  long  SPEED_STEP   = 2;        /* km/h change per cycle towards target    */
+  long  DEFAULT_TARGET = 60;     /* km/h                                    */
+
+  /* -------- timers -------- */
+  msTimer tCycle;
+
+  /* -------- message objects -------- */
+  message 0x100 msgStatus;
+  message 0x200 msgCommand;
+  message 0x300 msgAlive;
+
+  /* -------- state -------- */
+  dword gCycle        = 0;
+  long  gRpm          = 800;
+  long  gSpeedKph     = 0;
+  long  gTargetSpeed  = 60;
+  int   gGear         = 1;
+  byte  gEnable       = 1;
+  byte  gAliveCounter = 0;
+  byte  gCycleCounter = 0;
+}
+
+/*-----------------------------------------------------------------------------
+ *  Helpers
+ *----------------------------------------------------------------------------*/
+
+/* Triangular engine-speed profile: RPM_MIN -> RPM_MAX -> RPM_MIN */
+long nextRpm()
+{
+  long span;
+  long phase;
+
+  span  = (RPM_MAX - RPM_MIN) / RPM_STEP;
+  if (span < 1)
+  {
+    span = 1;
+  }
+
+  phase = (long)(gCycle % (2 * span));
+
+  if (phase <= span)
+  {
+    return RPM_MIN + phase * RPM_STEP;
+  }
+
+  return RPM_MIN + (2 * span - phase) * RPM_STEP;
+}
+
+void sendStatus()
+{
+  long rpmRaw;
+  long speedRaw;
+
+  gRpm = nextRpm();
+
+  /* ramp the vehicle speed towards the requested target */
+  if (gSpeedKph < gTargetSpeed)
+  {
+    gSpeedKph = gSpeedKph + SPEED_STEP;
+  }
+  else if (gSpeedKph > gTargetSpeed)
+  {
+    gSpeedKph = gSpeedKph - SPEED_STEP;
+  }
+
+  rpmRaw   = gRpm * 4;            /* 0.25 rpm/bit       */
+  speedRaw = gSpeedKph * 100;     /* 0.01 km/h/bit      */
+
+  msgStatus.dlc   = 8;
+  msgStatus.byte(0) = (byte)(rpmRaw & 0xFF);
+  msgStatus.byte(1) = (byte)((rpmRaw >> 8) & 0xFF);
+  msgStatus.byte(2) = (byte)(speedRaw & 0xFF);
+  msgStatus.byte(3) = (byte)((speedRaw >> 8) & 0xFF);
+  msgStatus.byte(4) = (byte)gGear;
+  msgStatus.byte(5) = gEnable;
+  msgStatus.byte(6) = gCycleCounter;
+  msgStatus.byte(7) = (byte)(gCycle & 0xFF);
+
+  output(msgStatus);
+}
+
+void sendAlive()
+{
+  gAliveCounter = (byte)((gAliveCounter + 1) & 0xFF);
+
+  msgAlive.dlc      = 8;
+  msgAlive.byte(0)  = gAliveCounter;
+  msgAlive.byte(1)  = (byte)(gCycle & 0xFF);
+  msgAlive.byte(2)  = 0xCC;
+  msgAlive.byte(3)  = 0xCC;
+  msgAlive.byte(4)  = 0xCC;
+  msgAlive.byte(5)  = 0xCC;
+  msgAlive.byte(6)  = 0xCC;
+  msgAlive.byte(7)  = 0xCC;
+
+  output(msgAlive);
+}
+
+void sendCommand(long targetKph)
+{
+  long raw;
+
+  if (targetKph < 0)
+  {
+    targetKph = 0;
+  }
+  if (targetKph > 250)
+  {
+    targetKph = 250;
+  }
+
+  raw = targetKph * 100;
+
+  msgCommand.dlc      = 8;
+  msgCommand.byte(0)  = (byte)(raw & 0xFF);
+  msgCommand.byte(1)  = (byte)((raw >> 8) & 0xFF);
+  msgCommand.byte(2)  = 0xCC;
+  msgCommand.byte(3)  = 0xCC;
+  msgCommand.byte(4)  = 0xCC;
+  msgCommand.byte(5)  = 0xCC;
+  msgCommand.byte(6)  = 0xCC;
+  msgCommand.byte(7)  = 0xCC;
+
+  output(msgCommand);
+}
+
+/*-----------------------------------------------------------------------------
+ *  Lifecycle
+ *----------------------------------------------------------------------------*/
+
+on start
+{
+  write("[SIM] started - cycle %d ms, ids 0x100/0x200/0x300", CYCLE_MS);
+  setTimer(tCycle, CYCLE_MS);
+}
+
+on stopMeasurement
+{
+  write("[SIM] stopped - cycles executed: %d, alive frames sent: %d",
+        gCycle, gAliveCounter);
+}
+
+on timer tCycle
+{
+  if (gEnable == 1)
+  {
+    sendStatus();
+    sendAlive();
+    gCycleCounter = (byte)((gCycleCounter + 1) & 0xFF);
+  }
+
+  gCycle = gCycle + 1;
+  setTimer(tCycle, CYCLE_MS);
+}
+
+/*-----------------------------------------------------------------------------
+ *  Inbound handling
+ *----------------------------------------------------------------------------*/
+
+on message 0x200
+{
+  long requested;
+
+  if (this.dlc < 2)
+  {
+    write("[SIM] WARN: 0x200 too short (dlc=%d), ignored", this.dlc);
+    return;
+  }
+
+  requested = (long)this.byte(0) | ((long)this.byte(1) << 8);
+  gTargetSpeed = requested / 100;
+
+  write("[SIM] target speed updated to %d km/h", gTargetSpeed);
+}
+
+/*-----------------------------------------------------------------------------
+ *  Keyboard control
+ *----------------------------------------------------------------------------*/
+
+on key 'a'
+{
+  gEnable = 1;
+  write("[SIM] output ENABLED");
+}
+
+on key 's'
+{
+  gEnable = 0;
+  write("[SIM] output DISABLED");
+}
+
+on key 'r'
+{
+  gCycle        = 0;
+  gSpeedKph     = 0;
+  gRpm          = RPM_MIN;
+  gTargetSpeed  = DEFAULT_TARGET;
+  gAliveCounter = 0;
+  gCycleCounter = 0;
+  write("[SIM] state reset");
+}
+
+on key 'c'
+{
+  sendCommand(gTargetSpeed);
+  write("[SIM] command frame sent (target %d km/h)", gTargetSpeed);
+}

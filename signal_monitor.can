@@ -1,0 +1,241 @@
+/*-----------------------------------------------------------------------------
+ *  signal_monitor.can
+ *
+ *  Passive monitor for the 0x100 status frame.
+ *  Tracks min / max / mean per signal, detects lost frames through the alive
+ *  counter, and raises debounced threshold alarms so that single-sample
+ *  spikes are not reported as failures.
+ *
+ *  Prerequisites : none (classic CAN, raw byte layout, no DBC required)
+ *  Keys          : 'm' print the current statistics, 'z' reset statistics
+ *----------------------------------------------------------------------------*/
+
+variables
+{
+  /* -------- configuration -------- */
+  long RPM_LIMIT_HIGH   = 3800;   /* rpm                                  */
+  long RPM_LIMIT_LOW    = 600;    /* rpm (only checked while enabled)      */
+  long SPEED_LIMIT_HIGH = 130;    /* km/h                                 */
+  long ALARM_DEBOUNCE   = 5;      /* consecutive samples before an alarm   */
+
+  /* -------- statistics -------- */
+  long gStatusFrames = 0;
+  long gRpmMin       = 0x7FFFFFFF;
+  long gRpmMax       = 0;
+  long gRpmSum       = 0;
+  long gSpeedMin     = 0x7FFFFFFF;
+  long gSpeedMax     = 0;
+  long gSpeedSum     = 0;
+
+  /* -------- alive counter -------- */
+  long gAliveFrames  = 0;
+  long gLastAlive    = -1;
+  long gLostFrames   = 0;
+
+  /* -------- alarm state -------- */
+  long gRpmHighCount   = 0;
+  long gRpmLowCount    = 0;
+  long gSpeedHighCount = 0;
+  long gRpmHighAlarms  = 0;
+  long gRpmLowAlarms   = 0;
+  long gSpeedAlarms    = 0;
+
+  /* -------- malformed frames -------- */
+  long gShortFrames  = 0;
+}
+
+/*-----------------------------------------------------------------------------
+ *  Statistics helpers
+ *----------------------------------------------------------------------------*/
+
+void resetStatistics()
+{
+  gStatusFrames = 0;
+  gRpmMin       = 0x7FFFFFFF;
+  gRpmMax       = 0;
+  gRpmSum       = 0;
+  gSpeedMin     = 0x7FFFFFFF;
+  gSpeedMax     = 0;
+  gSpeedSum     = 0;
+  gAliveFrames  = 0;
+  gLastAlive    = -1;
+  gLostFrames   = 0;
+  gRpmHighCount   = 0;
+  gRpmLowCount    = 0;
+  gSpeedHighCount = 0;
+  gRpmHighAlarms  = 0;
+  gRpmLowAlarms   = 0;
+  gSpeedAlarms    = 0;
+  gShortFrames    = 0;
+}
+
+void printStatistics()
+{
+  long rpmMean;
+  long speedMean;
+
+  write(" ");
+  write("================ SIGNAL MONITOR ================");
+  write(" frames received : %d", gStatusFrames);
+
+  if (gStatusFrames == 0)
+  {
+    write(" no status frame received yet");
+    write("================================================");
+    return;
+  }
+
+  rpmMean   = gRpmSum / gStatusFrames;
+  speedMean = gSpeedSum / gStatusFrames;
+
+  write(" rpm   : min %d | mean %d | max %d",  gRpmMin, rpmMean, gRpmMax);
+  write(" speed : min %d | mean %d | max %d",  gSpeedMin, speedMean, gSpeedMax);
+  write(" alive : frames %d | lost %d", gAliveFrames, gLostFrames);
+  write(" alarms: rpm_high %d | rpm_low %d | speed_high %d",
+        gRpmHighAlarms, gRpmLowAlarms, gSpeedAlarms);
+  write(" malformed short frames : %d", gShortFrames);
+  write("================================================");
+}
+
+/*-----------------------------------------------------------------------------
+ *  Frame decoding
+ *----------------------------------------------------------------------------*/
+
+on message 0x100
+{
+  long rpmRaw;
+  long speedRaw;
+  long rpm;
+  long speed;
+  long enabled;
+  long delta;
+
+  if (this.dlc < 6)
+  {
+    gShortFrames = gShortFrames + 1;
+    write("[MON] WARN: 0x100 with dlc=%d rejected", this.dlc);
+    return;
+  }
+
+  rpmRaw   = (long)this.byte(0) | ((long)this.byte(1) << 8);
+  speedRaw = (long)this.byte(2) | ((long)this.byte(3) << 8);
+  rpm      = rpmRaw / 4;
+  speed    = speedRaw / 100;
+  enabled  = (long)this.byte(5);
+
+  gStatusFrames = gStatusFrames + 1;
+  gRpmSum       = gRpmSum + rpm;
+  gSpeedSum     = gSpeedSum + speed;
+
+  if (rpm < gRpmMin)
+  {
+    gRpmMin = rpm;
+  }
+  if (rpm > gRpmMax)
+  {
+    gRpmMax = rpm;
+  }
+  if (speed < gSpeedMin)
+  {
+    gSpeedMin = speed;
+  }
+  if (speed > gSpeedMax)
+  {
+    gSpeedMax = speed;
+  }
+
+  /* -------- debounced rpm high alarm -------- */
+  if (rpm > RPM_LIMIT_HIGH)
+  {
+    gRpmHighCount = gRpmHighCount + 1;
+    if (gRpmHighCount == ALARM_DEBOUNCE)
+    {
+      gRpmHighAlarms = gRpmHighAlarms + 1;
+      write("[MON] ALARM: rpm %d above limit %d (debounced)", rpm, RPM_LIMIT_HIGH);
+    }
+  }
+  else
+  {
+    gRpmHighCount = 0;
+  }
+
+  /* -------- debounced rpm low alarm, engine running only -------- */
+  if (enabled == 1 && rpm < RPM_LIMIT_LOW)
+  {
+    gRpmLowCount = gRpmLowCount + 1;
+    if (gRpmLowCount == ALARM_DEBOUNCE)
+    {
+      gRpmLowAlarms = gRpmLowAlarms + 1;
+      write("[MON] ALARM: rpm %d below limit %d (debounced)", rpm, RPM_LIMIT_LOW);
+    }
+  }
+  else
+  {
+    gRpmLowCount = 0;
+  }
+
+  /* -------- debounced speed alarm -------- */
+  if (speed > SPEED_LIMIT_HIGH)
+  {
+    gSpeedHighCount = gSpeedHighCount + 1;
+    if (gSpeedHighCount == ALARM_DEBOUNCE)
+    {
+      gSpeedAlarms = gSpeedAlarms + 1;
+      write("[MON] ALARM: speed %d above limit %d (debounced)", speed, SPEED_LIMIT_HIGH);
+    }
+  }
+  else
+  {
+    gSpeedHighCount = 0;
+  }
+}
+
+/*-----------------------------------------------------------------------------
+ *  Alive counter: detect missing frames
+ *----------------------------------------------------------------------------*/
+
+on message 0x300
+{
+  long counter;
+  long expected;
+
+  if (this.dlc < 1)
+  {
+    return;
+  }
+
+  counter = (long)this.byte(0);
+
+  if (gLastAlive >= 0)
+  {
+    expected = (gLastAlive + 1) & 0xFF;
+    if (counter != expected)
+    {
+      gLostFrames = gLostFrames + 1;
+      write("[MON] WARN: alive counter gap, expected %d got %d", expected, counter);
+    }
+  }
+
+  gLastAlive   = counter;
+  gAliveFrames = gAliveFrames + 1;
+}
+
+/*-----------------------------------------------------------------------------
+ *  Keyboard control
+ *----------------------------------------------------------------------------*/
+
+on key 'm'
+{
+  printStatistics();
+}
+
+on key 'z'
+{
+  resetStatistics();
+  write("[MON] statistics reset");
+}
+
+on stopMeasurement
+{
+  printStatistics();
+}
