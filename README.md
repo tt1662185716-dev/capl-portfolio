@@ -134,5 +134,5 @@ obtain an extended educational licence. Verify current terms on the Vector websi
 Automotive test engineer — CAPL / CANoe / HIL / ADAS validation.
 Available for contract work on test automation, bench setups and diagnostic tooling.
 
-- Email: you@example.com
-- GitHub: [@yourname](https://github.com/yourname)
+- Email: tt1662185716@Gmail.com
+- GitHub: [@tt1662185716-dev](https://github.com/tt1662185716-dev)
